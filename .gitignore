@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+venv/
+*.pyc
+
+# OS
+.DS_Store
+
+# IDEs
+.idea/
+.vscode/
+.ignore
+*.lua
+
+# Database
+*.db
+*.db*
+
+# Config
+config*.json
+!config.example.json
+
+# Project specific
+bin/
+logs/
+tmp/
+notes*
