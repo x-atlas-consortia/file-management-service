@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sync"
 
@@ -63,7 +64,7 @@ func buildFileItem(ctx context.Context, db *database.Database, path string) (dat
 		return database.InsertFileItem{}, false, nil
 	}
 
-	datasetUUID := datasetUUIDRe.FindString(path)
+	datasetUUID := datasetUUIDFromPath(path)
 	if datasetUUID == "" {
 		return database.InsertFileItem{}, false, fmt.Errorf("no dataset UUID found in path %q", path)
 	}
@@ -85,8 +86,12 @@ func buildFileItem(ctx context.Context, db *database.Database, path string) (dat
 	}, true, nil
 }
 
-// datasetUUIDRe matches the first 32-char lowercase hex run in a path.
+// datasetUUIDRe matches the first 32-char lowercase hex run in a directory path.
 var datasetUUIDRe = regexp.MustCompile(`[a-f0-9]{32}`)
+
+func datasetUUIDFromPath(path string) string {
+	return datasetUUIDRe.FindString(filepath.Dir(path))
+}
 
 // hashBufPool reuses copy buffers so each hashed file doesn't allocate its own.
 var hashBufPool = sync.Pool{New: func() any { b := make([]byte, 256*1024); return &b }}
