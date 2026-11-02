@@ -17,8 +17,8 @@ venv/
 *.db*
 
 # Config
-config*.json
-!config.example.json
+*.ini
+!config.ini.example
 
 # Project specific
 bin/

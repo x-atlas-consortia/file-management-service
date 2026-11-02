@@ -11,11 +11,13 @@ import (
 	"github.com/x-atlas-consortia/file-management-service/internal/database"
 )
 
-func Start(ctx context.Context, logLevel slog.Leveler, profile string, directories []string, ignorePatterns []string, walkers, processors int) error {
+func Start(ctx context.Context, logLevel slog.Leveler, cfg *core.Config) error {
 	startTime := time.Now().UTC()
+	directories, ignorePatterns := cfg.Directories, cfg.PrunableFilepaths
+	walkers, processors := cfg.Walkers, cfg.Processors
 
 	// Setup logger
-	logger, logWriter, err := core.NewLogger("scan-start", profile, logLevel)
+	logger, logWriter, err := core.NewLogger("scan-start", cfg.Name, cfg.LogDirectory, logLevel)
 	if err != nil {
 		slog.Error("Failed to create logger", "error", err)
 		return err
@@ -25,7 +27,7 @@ func Start(ctx context.Context, logLevel slog.Leveler, profile string, directori
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	dbPath := core.GetDatabasePath(profile)
+	dbPath := cfg.DatabaseFilepath
 
 	logger.Info("Starting file backup process",
 		slog.Int("directories", len(directories)),
