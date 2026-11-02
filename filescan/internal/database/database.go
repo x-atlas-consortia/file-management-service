@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -60,6 +61,10 @@ func New(ctx context.Context, dsn string, readonly bool) (*Database, error) {
 	var err error
 
 	if !readonly {
+		if err := os.MkdirAll(filepath.Dir(dsn), 0755); err != nil {
+			return nil, fmt.Errorf("error creating database directory: %w", err)
+		}
+
 		// Create and keep lock file open to prevent multiple writers
 		lockFilePath := dsn + ".lock"
 		lockFile, err = createLockFile(lockFilePath)

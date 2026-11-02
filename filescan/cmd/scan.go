@@ -1,12 +1,10 @@
 package cmd
 
 import (
-	"errors"
-	"fmt"
 	"log/slog"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
+	"github.com/x-atlas-consortia/file-management-service/internal/core"
 	"github.com/x-atlas-consortia/file-management-service/internal/scan"
 )
 
@@ -24,46 +22,12 @@ var scanStartCmd = &cobra.Command{
 			panic("log-level not found in context")
 		}
 
-		profile, ok := cmd.Context().Value("profile").(string)
+		cfg, ok := cmd.Context().Value("config").(*core.Config)
 		if !ok {
-			panic("profile not found in context")
+			panic("config not found in context")
 		}
 
-		directories, err := cmd.Flags().GetStringSlice("directories")
-		if err != nil {
-			return err
-		}
-		if len(directories) < 1 {
-			return errors.New("at least one directory must be specified")
-		}
-
-		walkers, err := cmd.Flags().GetInt("walkers")
-		if err != nil {
-			return err
-		}
-		if walkers < 1 {
-			return errors.New("walkers must be at least 1")
-		}
-
-		processors, err := cmd.Flags().GetInt("processors")
-		if err != nil {
-			return err
-		}
-		if processors < 1 {
-			return errors.New("processors must be at least 1")
-		}
-
-		ignorePatterns, err := cmd.Flags().GetStringSlice("ignore")
-		if err != nil {
-			return err
-		}
-		for _, pattern := range ignorePatterns {
-			if _, err := filepath.Match(pattern, ""); err != nil {
-				return fmt.Errorf("invalid ignore pattern %q: %w", pattern, err)
-			}
-		}
-
-		return scan.Start(cmd.Context(), logLevel, profile, directories, ignorePatterns, walkers, processors)
+		return scan.Start(cmd.Context(), logLevel, cfg)
 	},
 }
 
@@ -71,18 +35,4 @@ func init() {
 	// Add scanStartCmd as a subcommand of scanCmd
 	scanCmd.AddCommand(scanStartCmd)
 	rootCmd.AddCommand(scanCmd)
-
-	// Scan start flags
-	// directories flag
-	scanStartCmd.Flags().StringSliceP("directories", "D", []string{}, "List of directories to scan (multiple -D flags allowed or comma-separated string)")
-	scanStartCmd.MarkFlagRequired("directories")
-
-	// ignore flag
-	scanStartCmd.Flags().StringSliceP("ignore", "i", []string{}, "Glob patterns to ignore, matched against file/directory names and full paths (multiple -i flags allowed or comma-separated)")
-
-	// walkers flag
-	scanStartCmd.Flags().Int("walkers", 4, "Number of concurrent directory walkers (default: 4)")
-
-	// processors flag
-	scanStartCmd.Flags().Int("processors", 4, "Number of concurrent file processors (default: 4)")
 }

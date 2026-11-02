@@ -13,12 +13,13 @@ var rootCmd = &cobra.Command{
 	Use:   "filescan",
 	Short: "FileScan is a simple file scanning tool",
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		profile, err := cmd.Flags().GetString("profile")
+		configPath, err := cmd.Flags().GetString("config")
 		if err != nil {
 			return err
 		}
-		if profile == "" {
-			profile = core.DefaultProfile
+		cfg, err := core.LoadConfig(configPath)
+		if err != nil {
+			return err
 		}
 
 		logLevelStr, err := cmd.Flags().GetString("log-level")
@@ -32,7 +33,7 @@ var rootCmd = &cobra.Command{
 		}
 
 		cmd.SetContext(context.WithValue(cmd.Context(), "log-level", logLevel))
-		cmd.SetContext(context.WithValue(cmd.Context(), "profile", profile))
+		cmd.SetContext(context.WithValue(cmd.Context(), "config", cfg))
 
 		return nil
 	},
@@ -50,5 +51,6 @@ func Execute() {
 // Initialize persistent flags
 func init() {
 	rootCmd.PersistentFlags().StringP("log-level", "l", "info", "Set the log level (debug, info, warn, error)")
-	rootCmd.PersistentFlags().StringP("profile", "p", "", "Set the config profile to use (overrides the default profile)")
+	rootCmd.PersistentFlags().StringP("config", "c", "", "Path to the ini config file")
+	rootCmd.MarkPersistentFlagRequired("config")
 }

@@ -28,47 +28,27 @@ The Docker build script produces a Linux amd64 binary at `filescan/bin/filescan`
 ./filescan/build.sh
 ```
 
-## Scan directories
+## Configuration
 
-Start a scan by providing at least one directory. You can specify multiple directories with repeated `-D` flags or a comma-separated value:
+All settings come from an ini file whose path is passed with `-c`/`--config`:
 
-```sh
-./bin/filescan scan start -D /data/archive
-./bin/filescan scan start -D /data/archive -D /data/another-archive
-./bin/filescan scan start --directories /data/archive,/data/another-archive
+```ini
+[Default]
+DATABASE_FILEPATH = /some/path/indexed_files_dev.db
+DIRECTORIES = ['/data/archive', '/data/another-archive']
+PRUNABLE_FILEPATHS = ['*.zarr/', '*.tmp']
+LOG_DIRECTORY = ./logs
+WALKERS = 4
+PROCESSORS = 4
 ```
 
-To exclude entries, use `-i`/`--ignore`. Patterns are matched against both an entry's name and its full path using Go's `filepath.Match` glob syntax. A trailing slash limits a pattern to directories:
+`DATABASE_FILEPATH` and `DIRECTORIES` are required. `PRUNABLE_FILEPATHS` entries are matched against both an entry's name and its full path using Go's `filepath.Match` glob syntax; a trailing slash limits a pattern to directories. `WALKERS` and `PROCESSORS` default to 4 and must be at least 1. Walkers enumerate directories; processors hash new or changed files.
 
 ```sh
-./bin/filescan scan start -D /data/archive \
-  -i '*.tmp' \
-  -i 'cache/'
+./bin/filescan --config ./filescan.ini --log-level debug scan start
 ```
 
-You can combine multiple directories and ignore patterns in one scan:
-
-```sh
-./bin/filescan scan start \
-  -D /data/archive \
-  -D /data/another-archive \
-  -i '*.tmp' \
-  -i 'cache/'
-```
-
-The scanner skips symbolic links. It uses four directory walkers and four file processors by default. Walkers enumerate directories; processors inspect files and hash new or changed content. Adjust either pool to suit the machine and the storage being scanned:
-
-```sh
-./bin/filescan scan start -D /data/archive --walkers 8 --processors 6
-```
-
-For a starting point, leave the defaults in place, then increase one setting at a time and compare scan duration and system load. More walkers can help when traversing many directories, while more processors can help when processing many files. Hashing reads file contents, so processor concurrency is often limited by storage throughput, especially on network or slower disks; too many workers can add contention without speeding up a scan. Keep both values at least 1, and tune separately for each host and storage environment.
-
-Run `./bin/filescan scan start --help` for command-specific options. Global options include `--profile` (`-p`) and `--log-level` (`-l`, one of `debug`, `info`, `warn`, or `error`). For example:
-
-```sh
-./bin/filescan --profile staging --log-level debug scan start -D /data/archive
-```
+The scanner skips symbolic links. `--log-level` (`-l`) is one of `debug`, `info`, `warn`, or `error`. Log files are written to `LOG_DIRECTORY` (default `./logs`) as well as printed to the console.
 
 ## File records and storage
 
@@ -80,12 +60,6 @@ For each new or changed file, FileScan stores its path, size, modification time,
 
 Unchanged files are skipped based on their size and modification time. Keep directory paths consistent between runs, since the path itself is used to identify file records.
 
-The database is created automatically at:
-
-```text
-~/.local/share/filescan/filescan-<profile>.db
-```
-
-The default profile is `default`. Log files are written to `~/.local/share/filescan/logs/` as well as printed to the console.
+The database is created automatically at `DATABASE_FILEPATH`.
 
 At the end of a completed scan, previously recorded files under each scanned directory that were not encountered are marked deleted. Ignored paths are not encountered, so adding an ignore pattern for a previously indexed file can cause it to be marked deleted. A cancelled scan does not perform deletion detection. Scanning only the directories that should be reconciled helps avoid unintended deletion marks.
