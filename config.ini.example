@@ -1,0 +1,6 @@
+[Default]
+DATABASE_FILEPATH = /some/path/indexed_files_dev.db
+DIRECTORIES = ['/data/archive', '/data/another-archive']
+PRUNABLE_FILEPATHS = ['*.zarr/', '*.tmp']
+WALKERS = 4
+PROCESSORS = 4

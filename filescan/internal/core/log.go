@@ -9,12 +9,9 @@ import (
 	"time"
 )
 
-const logDirectory = "$HOME/.local/share/filescan/logs"
-
-// NewLogger creates a new slog.Logger that logs to both console and a file.
-func NewLogger(cmd, profile string, level slog.Leveler) (*slog.Logger, io.Writer, error) {
+// NewLogger creates a new slog.Logger that logs to both console and a file in logDir.
+func NewLogger(cmd, profile, logDir string, level slog.Leveler) (*slog.Logger, io.Writer, error) {
 	// Ensure log directory exists
-	logDir := os.ExpandEnv(logDirectory)
 	err := os.MkdirAll(logDir, 0700)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create log directory: %w", err)
