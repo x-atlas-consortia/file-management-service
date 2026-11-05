@@ -16,6 +16,11 @@ class FileManager:
         self,
         ingest_api_url: str,
         ubkg_url: str,
+        # New: was missing entirely - _get_dataset_type_hierarchy() below called UBKG
+        # with application_context hardcoded to "sennet", unconditionally, regardless
+        # of which app fileindex.py was running as. Now passed in explicitly from
+        # file_indexing_utils.ubkg_application_context at construction time.
+        ubkg_application_context: str,
         token: str,
         session: Session,
         logger: Logger,
@@ -30,7 +35,9 @@ class FileManager:
             "",  # current dataset UUID
             dict(),  # mapping of file paths to descriptions
         )
-        self._dataset_type_hierarchy_map = self._get_dataset_type_hierarchy(ubkg_url, session)
+        self._dataset_type_hierarchy_map = self._get_dataset_type_hierarchy(
+            ubkg_url, ubkg_application_context, session
+        )
 
     def get_additional_info(self, dataset: Record, path: str) -> Optional[dict]:
         if dataset["creation_action"] == "Create Dataset Activity":
@@ -160,9 +167,18 @@ class FileManager:
             return self._fetch_schema(content)
         return content.get("files", [])
 
-    def _get_dataset_type_hierarchy(self, ubkg_url: str, session: Session) -> dict[str, list[str]]:
+    def _get_dataset_type_hierarchy(
+        self, ubkg_url: str, ubkg_application_context: str, session: Session
+    ) -> dict[str, list[str]]:
+        # Changed: application_context was hardcoded to "sennet" here, unconditionally
+        # - this ran at FileManager construction time regardless of which app
+        # fileindex.py was indexing for. A HuBMAP run would get SenNet's dataset-type
+        # hierarchy back with no error (UBKG returns 200 either way), so a HuBMAP
+        # dataset_type value that happens to also exist in SenNet's hierarchy (e.g.
+        # "CODEX", seen in both projects' real data) could silently get attached the
+        # wrong hierarchy entries, rather than correctly having none.
         res = session.get(
-            f"{ubkg_url}/dataset-types/hierarchy?application_context=sennet",
+            f"{ubkg_url}/dataset-types/hierarchy?application_context={ubkg_application_context}",
             timeout=TIMEOUT,
         )
         if res.status_code != 200:

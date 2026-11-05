@@ -1,0 +1,35 @@
+[DEFAULT]
+; New: selects which app's Cypher queries, UBKG context, and ES document field
+; names FileIndexingUtils binds at startup. Must be "hubmap" or "sennet".
+APP=hubmap|sennet
+
+[Local]
+LOG_ID = dev
+LOG_LEVEL = ERROR
+; Options: DEBUG, INFO, WARNING, ERROR
+
+[ElasticSearch]
+ELASTIC_SEARCH_URL = http://elastic-search:8080
+ELASTIC_SEARCH_PUBLIC_INDEX = sn_dev_public_files
+ELASTIC_SEARCH_PRIVATE_INDEX = sn_dev_consortium_files
+
+[Globus]
+GLOBUS_GROUPS_TOKEN = changeme
+GLOBUS_ROOT_ENDPOINT_FILEPATH = /root/directory/to/globus/data
+GLOBUS_PUBLIC_ENDPOINT_FILEPATH = %(GLOBUS_ROOT_ENDPOINT_FILEPATH)s/public
+GLOBUS_CONSORTIUM_ENDPOINT_FILEPATH = %(GLOBUS_ROOT_ENDPOINT_FILEPATH)s/consortium
+GLOBUS_PROTECTED_ENDPOINT_FILEPATH = %(GLOBUS_ROOT_ENDPOINT_FILEPATH)s/protected
+
+[Neo4J]
+NEO4J_URI = bolt://sennet-neo4j-localhost:7687
+NEO4J_USERNAME = neo4j
+NEO4J_PASSWORD = changeme
+
+[Service]
+INGEST_API_URL = http://uuid-api:8080
+UBKG_URL = http://ontology-api:8080
+UUID_API_URL = http://uuid-api:8080
+
+[Slack]
+; Unchanged from before this work - not app-specific.
+SLACK_WEBHOOK_URL = https://hooks.slack.com/changeme

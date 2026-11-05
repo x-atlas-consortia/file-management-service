@@ -14,7 +14,11 @@ from typing import Optional, Union
 
 from fileindex.database import Database, DBFile
 from fileindex.filemanager import FileManager
-from neo4j import Driver, GraphDatabase, Record
+# New: isolates the HuBMAP-vs-SenNet differences (Cypher, record parsing, UBKG
+# context, ES document identity fields). See file_indexing_utils.py's module
+# docstring for the full rationale.
+from fileindex.file_indexing_utils import FileIndexingUtils
+from neo4j import Driver, GraphDatabase
 from requests import Session
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -22,6 +26,8 @@ from urllib3.util.retry import Retry
 Config = namedtuple(
     "Config",
     [
+        # New: selects which app's Cypher/UBKG/field-naming FileIndexingUtils binds.
+        "app",
         "database",
         "log_id",
         "log_level",
@@ -54,6 +60,17 @@ def parse_config() -> Config:
     parser.add_argument(
         "--config", default="config.ini", help="Path to the configuration file (ini format)"
     )
+    # New: the config filescan (Go) also reads. Currently holds only DATABASE_FILEPATH
+    # - the one setting both tools need and must agree on. filescan's DIRECTORIES and
+    # PRUNABLE_FILEPATHS keys are Go-only right now; fileindex.py doesn't read them,
+    # since it derives its own directory structure from the Globus endpoint paths in
+    # --config instead. DATABASE_FILEPATH must NOT also be set in --config's [Local]
+    # section - this file is now the single source for it.
+    parser.add_argument(
+        "--shared-config",
+        default="src/config.ini",
+        help="Path to the config shared with filescan (ini format)",
+    )
     parser.add_argument(
         "--force-update",
         dest="force_update",
@@ -75,11 +92,32 @@ def parse_config() -> Config:
         with open(args.dataset_uuid_filepath, "r", encoding="utf-8") as f:
             dataset_uuids = [line.strip() for line in f if line.strip()]
 
+    if not os.path.isfile(args.shared_config):
+        parser.error(f"Shared config file not found: {args.shared_config}")
+
+    # New: a second, separate ConfigParser for the file filescan also reads. Kept
+    # separate from `c` below rather than merged into one parser, so it's always
+    # visually obvious in this function which file a given setting comes from.
+    # filescan's config uses a plain section named "Default" (capital D only) - this
+    # is NOT Python's special-cased [DEFAULT] section (that's spelled in full caps,
+    # and only matters for the `c` parser below, for the unrelated APP key); it's just
+    # an ordinary section here, matched by exact, case-sensitive name.
+    shared_c = ConfigParser()
+    shared_c.read(args.shared_config)
+
     c = ConfigParser()
     c.read(args.config)
 
     return Config(
-        database=c.get("Local", "DATABASE_FILEPATH", fallback="local_file_index.db"),
+        # New: [DEFAULT] APP = hubmap|sennet, read from the same config.ini everything
+        # else here already comes from. Defaults to "hubmap" only to keep a config.ini
+        # that predates this key from breaking outright; every real config should set
+        # this explicitly rather than rely on the default.
+        app=c.get("DEFAULT", "APP", fallback="hubmap"),
+        # Changed: DATABASE_FILEPATH now comes from --shared-config, not --config.
+        # No fallback - there's no sane default database path, and a missing key here
+        # should fail loudly rather than silently fall back to a wrong/empty database.
+        database=shared_c.get("Default", "DATABASE_FILEPATH"),
         log_id=c.get("Local", "LOG_ID", fallback="default"),
         log_level=c.get("Local", "LOG_LEVEL", fallback="info"),
         elastic_search_url=c.get("ElasticSearch", "ELASTIC_SEARCH_URL"),
@@ -92,6 +130,9 @@ def parse_config() -> Config:
         neo4j_uri=c.get("Neo4J", "NEO4J_URI"),
         neo4j_username=c.get("Neo4J", "NEO4J_USERNAME"),
         neo4j_password=c.get("Neo4J", "NEO4J_PASSWORD"),
+        # Unchanged: Slack is config-driven, not app-driven. This webhook mechanism
+        # already works for both projects with no modification, so it isn't touched
+        # by the app-switching work in this file.
         slack_webhook_url=c.get("Slack", "SLACK_WEBHOOK_URL", fallback=None),
         ingest_api_url=c.get("Service", "INGEST_API_URL"),
         ubkg_url=c.get("Service", "UBKG_URL"),
@@ -122,6 +163,14 @@ config = parse_config()
 logger = setup_logger(config.log_id, config.log_level)
 terminate_event = threading.Event()
 
+# New: constructed once at startup from config.app. Everything app-specific below
+# reads from this object rather than branching on config.app itself.
+try:
+    file_indexing_utils = FileIndexingUtils(app=config.app)
+except ValueError as e:
+    logger.critical(str(e))
+    sys.exit(3)
+
 session = Session()
 retries = Retry(total=3, backoff_factor=1, status_forcelist=[408, 429, 500, 502, 503, 504])
 adapter = HTTPAdapter(max_retries=retries)
@@ -131,6 +180,11 @@ try:
     file_manager = FileManager(
         ingest_api_url=config.ingest_api_url,
         ubkg_url=config.ubkg_url,
+        # New: FileManager's own UBKG call (_get_dataset_type_hierarchy, used for the
+        # dataset_type_hierarchy field) was hardcoded to application_context="sennet",
+        # separately from and missed by the fix to get_ubkg_organs() above. Now reads
+        # the same app-selected context file_indexing_utils already resolved.
+        ubkg_application_context=file_indexing_utils.ubkg_application_context,
         token=config.globus_groups_token,
         session=session,
         logger=logger,
@@ -141,7 +195,12 @@ except Exception as e:
 
 
 def get_ubkg_organs() -> list[dict]:
-    res = session.get(f"{config.ubkg_url}/organs?application_context=sennet", timeout=TIMEOUT)
+    # Changed: application_context was hardcoded to "sennet". Now reads from
+    # file_indexing_utils, which resolves to "hubmap" or "sennet" based on config.app.
+    res = session.get(
+        f"{config.ubkg_url}/organs?application_context={file_indexing_utils.ubkg_application_context}",
+        timeout=TIMEOUT,
+    )
     if res.status_code != 200:
         msg = f"Error fetching UBKG organs: {res.status_code}"
         raise Exception(msg)
@@ -162,7 +221,11 @@ def get_files_from_uuid_api(dataset_uuid: str) -> list[dict]:
     return res.json()
 
 
-def get_dataset_globus_path(dataset: Record) -> str:
+def get_dataset_globus_path(dataset: dict) -> str:
+    # Changed: type hint only, Record -> dict. dataset is now always a plain dict -
+    # either file_indexing_utils.parse_dataset_record()'s output (HuBMAP) or a
+    # dict(record) copy (SenNet) - never a raw neo4j.Record. Key-based access
+    # (dataset["x"]) behaves identically either way, so no behavior changes here.
     if dataset["contains_human_genetic_sequences"] is True:
         return os.path.join(
             config.globus_protected_endpoint_filepath, dataset["group_name"], dataset["uuid"]
@@ -189,6 +252,10 @@ def get_docs_from_es(index: str, dataset_uuid: str, fields: list[str]) -> list[d
         "query": {"term": {"dataset_uuid": dataset_uuid}},
     }
     res = session.post(search_url, json=query, timeout=TIMEOUT)
+    if res.status_code == 404:
+        # Index doesn't exist yet - treat as "no documents" rather than an error.
+        # bulk_update_es_indices's write below auto-creates the index on first use.
+        return docs
     res.raise_for_status()
     data = res.json()
     scroll_id = data["_scroll_id"]
@@ -366,31 +433,37 @@ def index_published_datasets(
     num_errors = 0
     dataset_uuids = []
     with driver.session() as neo4j_session:
-        # query for primary and processed datasets with a status of Published
+        # Changed: the hardcoded SenNet Cypher string is now file_indexing_utils's
+        # app-selected published_query (HuBMAP or SenNet, chosen at startup).
         datasets = neo4j_session.run(
-            "MATCH (d:Dataset)-[:WAS_GENERATED_BY]->(a:Activity)-[:USED|WAS_GENERATED_BY*..16]->(o:Sample{sample_category:'Organ'})-[:WAS_GENERATED_BY]->(:Activity)-[:USED]->(s:Source) "
-            "WHERE a.creation_action IN ['Create Dataset Activity', 'Central Process'] "
-            "AND d.status = 'Published' "
-            "AND ($dataset_uuids = [] OR d.uuid IN $dataset_uuids) "
-            "WITH DISTINCT d, a, o, s "
-            "WITH d, a, "
-            "COLLECT(DISTINCT apoc.map.fromValues(['uuid', o.uuid, 'code', o.organ])) AS organs, "
-            "COLLECT(DISTINCT apoc.map.fromValues(['uuid', s.uuid, 'source_type', s.source_type])) AS sources "
-            "RETURN d.uuid AS uuid, d.sennet_id AS sennet_id, d.group_name AS group_name, "
-            "d.status AS status, d.dataset_type AS dataset_type, d.data_access_level AS data_access_level, "
-            "d.contains_human_genetic_sequences AS contains_human_genetic_sequences, "
-            "apoc.convert.fromJsonMap(d.metadata) AS metadata, apoc.convert.fromJsonList(d.files) AS files, "
-            "a.creation_action AS creation_action, sources, organs",
+            file_indexing_utils.published_query,
             dataset_uuids=config.dataset_uuids,
         )
 
-        for dataset in datasets:
+        for raw_record in datasets:
             if terminate_event.is_set():
                 logger.info("Termination signal received, stopping indexing.")
                 return dataset_uuids, num_errors
 
             time.sleep(1)
-            dataset_uuids.append(dataset["uuid"])
+
+            # New: record this dataset's uuid unconditionally, before attempting to
+            # parse it below. A dataset that fails to parse still exists in Neo4j - it
+            # isn't gone, just unparsable this run. Appending the uuid here protects it
+            # from main()'s end-of-run stale-dataset cleanup, which deletes ES
+            # documents for any dataset_uuid NOT in this list. Appending only after a
+            # successful parse would make a parse failure look identical to a deleted
+            # dataset, and incorrectly delete that dataset's real ES documents.
+            dataset_uuids.append(raw_record["uuid"])
+
+            # New: converts the raw Neo4j record into a plain dict, parsing
+            # metadata_str/files_str for HuBMAP (see file_indexing_utils.py). Returns
+            # None if parsing failed - skip just this one dataset, already counted
+            # above so its existing ES documents aren't touched by the stale cleanup.
+            dataset = file_indexing_utils.parse_dataset_record(raw_record)
+            if dataset is None:
+                num_errors += 1
+                continue
 
             # add organ label and hierarchy from ubkg to each organ
             organs = [
@@ -566,7 +639,6 @@ def index_published_datasets(
                             "sha256_checksum": uuid_file["sha256_checksum"],
                             "md5_checksum": uuid_file["md5_checksum"],
                             "dataset_uuid": dataset["uuid"],
-                            "dataset_sennet_id": dataset["sennet_id"],
                             "dataset_status": dataset["status"],
                             "dataset_type": dataset["dataset_type"],
                             "data_access_level": dataset["data_access_level"],
@@ -575,9 +647,13 @@ def index_published_datasets(
                             "organs": organs,
                             "rel_path": uuid_file["path"],
                             "size": uuid_file["size"],
-                            "sources": dataset["sources"],
                             "last_modified_at": local_file.last_modified_at,
                         }
+                        # Changed: "dataset_sennet_id"/"sources" were hardcoded here.
+                        # build_identity_fields() returns the right field names and
+                        # values for whichever app is active (dataset_hubmap_id/donors,
+                        # or dataset_sennet_id/sources).
+                        doc.update(file_indexing_utils.build_identity_fields(dataset))
                         if additional_info is not None:
                             doc.update(additional_info)
 
@@ -607,31 +683,26 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
     num_errors = 0
     dataset_uuids = []
     with driver.session() as neo4j_session:
-        # query for primary and processed datasets with a status of QA or Submitted.
+        # Changed: see index_published_datasets above - same substitution, QA query.
         datasets = neo4j_session.run(
-            "MATCH (d:Dataset)-[:WAS_GENERATED_BY]->(a:Activity)-[:USED|WAS_GENERATED_BY*..16]->(o:Sample{sample_category:'Organ'})-[:WAS_GENERATED_BY]->(:Activity)-[:USED]->(s:Source) "
-            "WHERE a.creation_action IN ['Create Dataset Activity', 'Central Process'] "
-            "AND d.status IN ['Approval', 'QA', 'Submitted'] "
-            "AND ($dataset_uuids = [] OR d.uuid IN $dataset_uuids) "
-            "WITH DISTINCT d, a, o, s "
-            "WITH d, a, "
-            "COLLECT(DISTINCT apoc.map.fromValues(['uuid', o.uuid, 'code', o.organ])) AS organs, "
-            "COLLECT(DISTINCT apoc.map.fromValues(['uuid', s.uuid, 'source_type', s.source_type])) AS sources "
-            "RETURN d.uuid AS uuid, d.sennet_id AS sennet_id, d.group_name AS group_name, "
-            "d.status AS status, d.dataset_type AS dataset_type, d.data_access_level AS data_access_level, "
-            "d.contains_human_genetic_sequences AS contains_human_genetic_sequences, "
-            "apoc.convert.fromJsonMap(d.metadata) AS metadata, apoc.convert.fromJsonList(d.files) AS files, "
-            "a.creation_action AS creation_action, sources, organs",
+            file_indexing_utils.qa_query,
             dataset_uuids=config.dataset_uuids,
         )
 
-        for dataset in datasets:
+        for raw_record in datasets:
             if terminate_event.is_set():
                 logger.info("Termination signal received, stopping indexing.")
                 return dataset_uuids, num_errors
 
             time.sleep(1)
-            dataset_uuids.append(dataset["uuid"])
+
+            # New: see index_published_datasets above for why this is unconditional.
+            dataset_uuids.append(raw_record["uuid"])
+
+            dataset = file_indexing_utils.parse_dataset_record(raw_record)
+            if dataset is None:
+                num_errors += 1
+                continue
 
             # add organ label and hierarchy from ubkg to each organ
             organs = [
@@ -749,7 +820,6 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
                     )
                     doc = {
                         "dataset_uuid": dataset["uuid"],
-                        "dataset_sennet_id": dataset["sennet_id"],
                         "dataset_status": dataset["status"],
                         "dataset_type": dataset["dataset_type"],
                         "data_access_level": dataset["data_access_level"],
@@ -757,9 +827,10 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
                         "organs": organs,
                         "rel_path": rel_path,
                         "size": local_file.size,
-                        "sources": dataset["sources"],
                         "last_modified_at": local_file.last_modified_at,
                     }
+                    # Changed: see index_published_datasets above - same substitution.
+                    doc.update(file_indexing_utils.build_identity_fields(dataset))
                     if additional_info is not None:
                         doc.update(additional_info)
 
@@ -783,7 +854,9 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
 
 def main():
     try:
-        ubkg_organs = {o["organ_uberon"]: o for o in get_ubkg_organs()}
+        # Changed: "organ_uberon" was hardcoded. Now reads file_indexing_utils's
+        # app-selected key ("rui_code" for HuBMAP, "organ_uberon" for SenNet).
+        ubkg_organs = {o[file_indexing_utils.ubkg_organ_key]: o for o in get_ubkg_organs()}
     except Exception as e:
         logger.error(f"Error fetching UBKG organs: {e}")
         sys.exit(3)
@@ -847,6 +920,8 @@ def main():
     if terminate_event.is_set():
         return
 
+    # Unchanged: same bare webhook POST as before - not part of the app-switching
+    # work, see the note on Config.slack_webhook_url above.
     if config.slack_webhook_url and num_errors > 0:
         # Send a Slack message if there were errors
         session.post(
