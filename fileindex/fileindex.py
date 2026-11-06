@@ -17,7 +17,8 @@ from fileindex.filemanager import FileManager
 # New: isolates the HuBMAP-vs-SenNet differences (Cypher, record parsing, UBKG
 # context, ES document identity fields). See file_indexing_utils.py's module
 # docstring for the full rationale.
-from fileindex.file_indexing_utils import FileIndexingUtils
+from fileindex.src.file_indexing_utils import FileIndexingUtils
+from fileindex.src.timed_step import TimedStep
 from neo4j import Driver, GraphDatabase
 from requests import Session
 from requests.adapters import HTTPAdapter
@@ -28,6 +29,10 @@ Config = namedtuple(
     [
         # New: selects which app's Cypher/UBKG/field-naming FileIndexingUtils binds.
         "app",
+        # New: passed to FileIndexingUtils so it can read [Slack] from the same file
+        # everything else here already comes from - Slack settings now live entirely
+        # inside FileIndexingUtils, not in this Config.
+        "config_file_path",
         "database",
         "log_id",
         "log_level",
@@ -41,7 +46,11 @@ Config = namedtuple(
         "neo4j_uri",
         "neo4j_username",
         "neo4j_password",
-        "slack_webhook_url",
+        # Changed: was slack_webhook_url (the one setting this file read directly).
+        # Slack is now a richer, multi-key subsystem owned entirely by
+        # FileIndexingUtils (see file_indexing_utils.py) - this file only needs to
+        # know whether notifications are on at all, to pass through at construction.
+        "slack_notifications",
         "ingest_api_url",
         "ubkg_url",
         "uuid_api_url",
@@ -114,6 +123,7 @@ def parse_config() -> Config:
         # that predates this key from breaking outright; every real config should set
         # this explicitly rather than rely on the default.
         app=c.get("DEFAULT", "APP", fallback="hubmap"),
+        config_file_path=args.config,
         # Changed: DATABASE_FILEPATH now comes from --shared-config, not --config.
         # No fallback - there's no sane default database path, and a missing key here
         # should fail loudly rather than silently fall back to a wrong/empty database.
@@ -133,7 +143,11 @@ def parse_config() -> Config:
         # Unchanged: Slack is config-driven, not app-driven. This webhook mechanism
         # already works for both projects with no modification, so it isn't touched
         # by the app-switching work in this file.
-        slack_webhook_url=c.get("Slack", "SLACK_WEBHOOK_URL", fallback=None),
+        # Changed: this file no longer reads SLACK_WEBHOOK_URL (or any other Slack
+        # key) directly - FileIndexingUtils reads all of [Slack] itself from the same
+        # --config file, via config_file_path above. Only whether notifications are
+        # enabled at all needs to come through to the constructor call below.
+        slack_notifications=c.get("Slack", "SLACK_NOTIFICATIONS", fallback="ENABLED"),
         ingest_api_url=c.get("Service", "INGEST_API_URL"),
         ubkg_url=c.get("Service", "UBKG_URL"),
         uuid_api_url=c.get("Service", "UUID_API_URL"),
@@ -158,6 +172,13 @@ def setup_logger(log_id: str, log_level: str) -> logging.Logger:
 
 TIMEOUT = 30  # seconds
 
+# New: replaces the old blanket time.sleep(1) per dataset. Sits immediately before
+# the one call that actually needs spacing out (the UUID API fetch in
+# index_published_datasets) instead of throttling every dataset's SQLite/ES work
+# too. 0.05s is small enough that it's negligible at any real dataset count, but
+# still spaces out UUID API calls across a run.
+UUID_API_PER_DATASET_PAUSE = 0.05
+
 
 config = parse_config()
 logger = setup_logger(config.log_id, config.log_level)
@@ -166,8 +187,12 @@ terminate_event = threading.Event()
 # New: constructed once at startup from config.app. Everything app-specific below
 # reads from this object rather than branching on config.app itself.
 try:
-    file_indexing_utils = FileIndexingUtils(app=config.app)
-except ValueError as e:
+    file_indexing_utils = FileIndexingUtils(
+        app=config.app,
+        config_file_name=config.config_file_path,
+        disable_slack_notifications=(config.slack_notifications == "DISABLED"),
+    )
+except (ValueError, FileNotFoundError) as e:
     logger.critical(str(e))
     sys.exit(3)
 
@@ -445,7 +470,14 @@ def index_published_datasets(
                 logger.info("Termination signal received, stopping indexing.")
                 return dataset_uuids, num_errors
 
-            time.sleep(1)
+            # Changed: was an unconditional time.sleep(1) here, every dataset,
+            # regardless of whether this phase even calls an external API that needs
+            # throttling (it does, a few lines below - but a blanket sleep here
+            # throttles the SQLite/ES work above it too, work that isn't the actual
+            # target). At HuBMAP's original dataset count this alone cost ~5 hours of
+            # pure sleep per run. The targeted replacement sits immediately before
+            # the one call that actually needs spacing out - see UUID_API_PER_DATASET_PAUSE
+            # below.
 
             # New: record this dataset's uuid unconditionally, before attempting to
             # parse it below. A dataset that fails to parse still exists in Neo4j - it
@@ -495,6 +527,13 @@ def index_published_datasets(
                 continue
 
             try:
+                # New: the targeted replacement for the old blanket sleep(1) - a
+                # small pause right before the one call that needs it, timed with
+                # threshold=0.0 so its total cost across a run is visible in the
+                # log even though each individual pause is tiny.
+                with TimedStep(logger, f"UUID API pause for dataset {dataset['uuid']}", threshold=0.0):
+                    time.sleep(UUID_API_PER_DATASET_PAUSE)
+
                 # get files in uuid-api for the dataset
                 uuid_filepath_map = {
                     item["path"]: item
@@ -694,7 +733,10 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
                 logger.info("Termination signal received, stopping indexing.")
                 return dataset_uuids, num_errors
 
-            time.sleep(1)
+            # Changed: removed the old blanket time.sleep(1) entirely, with no
+            # replacement - this phase never calls the UUID API (that only happens
+            # in index_published_datasets), so there's nothing here that needs
+            # pacing against an external service.
 
             # New: see index_published_datasets above for why this is unconditional.
             dataset_uuids.append(raw_record["uuid"])
@@ -920,19 +962,23 @@ def main():
     if terminate_event.is_set():
         return
 
-    # Unchanged: same bare webhook POST as before - not part of the app-switching
-    # work, see the note on Config.slack_webhook_url above.
-    if config.slack_webhook_url and num_errors > 0:
-        # Send a Slack message if there were errors
-        session.post(
-            config.slack_webhook_url,
-            json={
-                "text": (
+    # Changed: was a bare webhook POST directly in this function. Now routed through
+    # FileIndexingUtils, which picks whichever Slack style (bot-token channel or
+    # webhook) is configured, applies @mentions, and is a safe no-op if neither style
+    # is configured or notifications are disabled - so this call never needs its own
+    # "is Slack set up" check the way the old bare POST did.
+    if num_errors > 0:
+        try:
+            file_indexing_utils.postToSlackChannel(
+                channel=file_indexing_utils.slack_notification_channel,
+                msg=(
                     f"{num_errors} errors occurred during {config.log_id} Elastic Search "
                     "file indexing."
-                )
-            },
-        )
+                ),
+                mentions_dict=file_indexing_utils.slack_error_mentions,
+            )
+        except Exception as e:
+            logger.error(f"Error posting to Slack: {e}")
 
 
 if __name__ == "__main__":

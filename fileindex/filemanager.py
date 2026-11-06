@@ -16,10 +16,6 @@ class FileManager:
         self,
         ingest_api_url: str,
         ubkg_url: str,
-        # New: was missing entirely - _get_dataset_type_hierarchy() below called UBKG
-        # with application_context hardcoded to "sennet", unconditionally, regardless
-        # of which app fileindex.py was running as. Now passed in explicitly from
-        # file_indexing_utils.ubkg_application_context at construction time.
         ubkg_application_context: str,
         token: str,
         session: Session,
@@ -35,9 +31,15 @@ class FileManager:
             "",  # current dataset UUID
             dict(),  # mapping of file paths to descriptions
         )
-        self._dataset_type_hierarchy_map = self._get_dataset_type_hierarchy(
-            ubkg_url, ubkg_application_context, session
-        )
+        # Dataset type hierarchy is a SenNet-only concept, but the supporting
+        # endpoint will give the SN hierarchy to all callers, without indicating
+        # it is inappropriate in other contexts.  So constrain that call here.
+        if ubkg_application_context in ['sennet']:
+            self._dataset_type_hierarchy_map = self._get_dataset_type_hierarchy(
+                ubkg_url, ubkg_application_context, session
+            )
+        else:
+            self._dataset_type_hierarchy_map = {}
 
     def get_additional_info(self, dataset: Record, path: str) -> Optional[dict]:
         if dataset["creation_action"] == "Create Dataset Activity":
@@ -170,15 +172,16 @@ class FileManager:
     def _get_dataset_type_hierarchy(
         self, ubkg_url: str, ubkg_application_context: str, session: Session
     ) -> dict[str, list[str]]:
-        # Changed: application_context was hardcoded to "sennet" here, unconditionally
-        # - this ran at FileManager construction time regardless of which app
-        # fileindex.py was indexing for. A HuBMAP run would get SenNet's dataset-type
-        # hierarchy back with no error (UBKG returns 200 either way), so a HuBMAP
-        # dataset_type value that happens to also exist in SenNet's hierarchy (e.g.
-        # "CODEX", seen in both projects' real data) could silently get attached the
-        # wrong hierarchy entries, rather than correctly having none.
+        # Dataset types hierarchy is a SenNet-only concept, and the endpoint supporting
+        # it does not process an application_context parameter nor otherwise indicate the
+        # concept is constrained to SN. To avoid misleading responses for a dataset type
+        # seen in both projects, such as 'CODEX', immediately raise an exception for
+        # unsupported ubkg_application_contexts.
+        if ubkg_application_context not in ['sennet']:
+            raise Exception(f"Dataset hierarchy in an unsupported context for"
+                            f" ubkg_application_context='{ubkg_application_context}'.")
         res = session.get(
-            f"{ubkg_url}/dataset-types/hierarchy?application_context={ubkg_application_context}",
+            f"{ubkg_url}/dataset-types/hierarchy",
             timeout=TIMEOUT,
         )
         if res.status_code != 200:

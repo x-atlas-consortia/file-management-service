@@ -1,6 +1,6 @@
 [DEFAULT]
-; New: selects which app's Cypher queries, UBKG context, and ES document field
-; names FileIndexingUtils binds at startup. Must be "hubmap" or "sennet".
+; Selects which app's Cypher queries, UBKG context, and ES document field names
+; FileIndexingUtils binds at startup. Must be "hubmap" or "sennet".
 APP=hubmap|sennet
 
 [Local]
@@ -31,5 +31,23 @@ UBKG_URL = http://ontology-api:8080
 UUID_API_URL = http://uuid-api:8080
 
 [Slack]
-; Unchanged from before this work - not app-specific.
-SLACK_WEBHOOK_URL = https://hooks.slack.com/changeme
+; Set to DISABLED to suppress all Slack notifications regardless of which style
+; below is configured - e.g. during local development.
+SLACK_NOTIFICATIONS = ENABLED
+
+; Style 1 is used if SLACK_CHANNEL_TOKEN is populated. Otherwise, style 2 is used
+; if SLACK_WEBHOOK_URL is populated. If neither is populated, notifications are
+; silently skipped. A populated SLACK_WEBHOOK_URL that fails to post raises an
+; error rather than failing silently - the caller decides whether to catch and
+; log it (fileindex.py's main() does).
+
+; Style 1: bot-token, posts to any channel in SLACK_SUPPORTED_CHANNELS, supports
+; @mentions and enforces SLACK_MAX_MSG_LENGTH.
+SLACK_CHANNEL_TOKEN =
+SLACK_SUPPORTED_CHANNELS =
+SLACK_NOTIFICATION_CHANNEL =
+SLACK_MAX_MSG_LENGTH = 2048
+SLACK_USER_ID_MENTIONS_ON_ERROR = {}
+
+; Style 2: webhook, a single fixed destination, no channel routing, no auth header.
+SLACK_WEBHOOK_URL =
