@@ -27,14 +27,25 @@ class FileManager:
         self._logger = logger
         self._ivt_directory_schemas = None
         self._primary_schemas = dict()
+        # Cache assaytype API responses keyed by dataset UUID, to avoid repeated HTTP
+        # calls to /assaytype/{dataset_uuid} for every file in the same dataset - this
+        # call only depends on dataset_uuid, so its result is identical for every file
+        # within one dataset. Only successful responses are cached; a failed fetch
+        # still raises and is retried on the next file, same as before this cache
+        # existed.
+        self._assay_type_cache = dict()
         self._processed_files = (
             "",  # current dataset UUID
             dict(),  # mapping of file paths to descriptions
         )
-        # Dataset type hierarchy is a SenNet-only concept, but the supporting
-        # endpoint will give the SN hierarchy to all callers, without indicating
-        # it is inappropriate in other contexts.  So constrain that call here.
-        if ubkg_application_context in ['sennet']:
+        # Dataset type hierarchy is a SenNet-only concept (see
+        # _get_dataset_type_hierarchy's docstring) - skip the call entirely for any
+        # other app, rather than calling it and relying on it to raise. The method's
+        # own guard stays in place as a defense against future misuse, but normal
+        # operation for a non-SenNet app should never reach it. get_additional_info()
+        # already handles an empty map gracefully via .get(...), so no change needed
+        # there - a HuBMAP dataset simply never gets a dataset_type_hierarchy field.
+        if ubkg_application_context == "sennet":
             self._dataset_type_hierarchy_map = self._get_dataset_type_hierarchy(
                 ubkg_url, ubkg_application_context, session
             )
@@ -111,14 +122,17 @@ class FileManager:
             raise Exception(f"Unknown creation_action: {dataset['creation_action']}")
 
     def _get_latest_file_schema(self, dataset_uuid: str) -> list[dict]:
-        res = self._session.get(
-            f"{self._ingest_api_url}/assaytype/{dataset_uuid}",
-            headers={"Authorization": f"Bearer {self._token}"},
-            timeout=TIMEOUT,
-        )
-        if res.status_code != 200:
-            raise Exception(f"Failed to fetch dataset info for UUID: {dataset_uuid}")
-        dir_schema = res.json().get("dir-schema")
+        if dataset_uuid not in self._assay_type_cache:
+            res = self._session.get(
+                f"{self._ingest_api_url}/assaytype/{dataset_uuid}",
+                headers={"Authorization": f"Bearer {self._token}"},
+                timeout=TIMEOUT,
+            )
+            if res.status_code != 200:
+                raise Exception(f"Failed to fetch dataset info for UUID: {dataset_uuid}")
+            self._assay_type_cache[dataset_uuid] = res.json()
+
+        dir_schema = self._assay_type_cache[dataset_uuid].get("dir-schema")
         if not dir_schema:
             raise Exception(f"No dir-schema found for Dataset UUID: {dataset_uuid}")
 
