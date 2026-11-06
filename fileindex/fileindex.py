@@ -264,7 +264,15 @@ def get_dataset_globus_path(dataset: dict) -> str:
     )
 
 
-def get_docs_from_es(index: str, dataset_uuid: str, fields: list[str]) -> list[dict]:
+def get_docs_from_es_by_scroll(index: str, dataset_uuid: str, fields: list[str]) -> list[dict]:
+    # Renamed from get_docs_from_es, unchanged otherwise. Kept for comparison/
+    # reference - not called from either index_published_datasets or
+    # index_qa_datasets, which both call get_docs_from_es_stateless instead.
+    #
+    # Scroll opens a server-side context per call; doing that once per dataset
+    # against a small managed OpenSearch domain previously exhausted its
+    # scroll-context capacity and produced sustained HTTP 429s, silently skipping
+    # most of a run's reconciliation - see get_docs_from_es_stateless below.
     scroll = "1m"  # save scroll context for 1 minute
     size = 10000
     docs = []
@@ -308,6 +316,61 @@ def get_docs_from_es(index: str, dataset_uuid: str, fields: list[str]) -> list[d
         )
         scroll_id = scroll_data["_scroll_id"]
         time.sleep(1)
+
+    return docs
+
+
+def get_docs_from_es_stateless(index: str, dataset_uuid: str, fields: list[str]) -> list[dict]:
+    # New: replaces the Scroll-based reconciliation read above with stateless
+    # search_after pagination. search_after needs no server-side context at all -
+    # no context to exhaust, no inter-page sleep needed since there's no context to
+    # keep alive.
+    #
+    # Sorting by rel_path.keyword is a valid total order here because every query is
+    # filtered to a single dataset_uuid, making rel_path unique within the result
+    # set. Most datasets fit in one page, so the common case is a single request
+    # with no pagination round-trips at all.
+    #
+    # Also fixed along with the pagination change: the term query now targets
+    # dataset_uuid.keyword (the exact-match keyword sub-field) rather than bare
+    # dataset_uuid (the analyzed text field) - the correct target for an exact term
+    # match, confirmed present in this index's mapping.
+    size = 10000
+    docs = []
+    search_url = f"{config.elastic_search_url}/{index}/_search"
+    base_query = {
+        "_source": fields,
+        "size": size,
+        "query": {"term": {"dataset_uuid.keyword": dataset_uuid}},
+        "sort": [{"rel_path.keyword": "asc"}],
+    }
+
+    with TimedStep(logger, f"ES search_after for dataset {dataset_uuid} in {index}"):
+        search_after = None
+        while True:
+            query = dict(base_query)
+            if search_after is not None:
+                query["search_after"] = search_after
+            res = session.post(search_url, json=query, timeout=TIMEOUT)
+            if res.status_code == 404:
+                # Index doesn't exist yet - treat as "no documents" rather than an
+                # error. bulk_update_es_indices's write below auto-creates the index
+                # on first use.
+                break
+            res.raise_for_status()
+            hits = res.json()["hits"]["hits"]
+            if not hits:
+                break
+            docs.extend(
+                {"_id": hit["_id"], **{field: hit["_source"].get(field) for field in fields}}
+                for hit in hits
+            )
+            # Fewer than a full page means this was the last page.
+            if len(hits) < size:
+                break
+            # Page again from the sort value of the last hit. No server-side
+            # context, so no scroll-id to carry and no inter-page pause needed.
+            search_after = hits[-1]["sort"]
 
     return docs
 
@@ -611,7 +674,7 @@ def index_published_datasets(
                     # get files in this specific elastic search index for the dataset
                     es_filepath_map = {
                         item["rel_path"]: item
-                        for item in get_docs_from_es(
+                        for item in get_docs_from_es_stateless(
                             index=index,
                             dataset_uuid=dataset["uuid"],
                             fields=es_fields,
@@ -781,7 +844,7 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
                 # get files in elastic search for the dataset
                 es_filepath_map = {
                     item["rel_path"]: item
-                    for item in get_docs_from_es(
+                    for item in get_docs_from_es_stateless(
                         index=config.elastic_search_private_index,
                         dataset_uuid=dataset["uuid"],
                         fields=[
