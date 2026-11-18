@@ -194,18 +194,28 @@ class FileIndexingUtils:
         self.slack_supported_channels = [c.strip() for c in supported.split(",") if c.strip()]
         self.slack_notification_channel = config.get("Slack", "SLACK_NOTIFICATION_CHANNEL", fallback="")
         self.slack_max_msg_length = int(config.get("Slack", "SLACK_MAX_MSG_LENGTH", fallback="2048"))
-        raw_mentions = config.get("Slack", "SLACK_USER_ID_MENTIONS_ON_ERROR", fallback="{}")
-        
+        self.slack_bad_news_emoji = config.get("Slack", "SLACK_BAD_NEWS_EMOJI", fallback=":bangbang:")
+        self.slack_good_news_emoji = config.get("Slack", "SLACK_GOOD_NEWS_EMOJI", fallback=":white_check_mark:")
+        self.slack_neutral_info_emoji = config.get("Slack", "SLACK_NEUTRAL_INFO_EMOJI", fallback=":bell:")
+        raw_mentions_on_err = config.get("Slack", "SLACK_USER_ID_MENTIONS_ON_ERROR", fallback="{}")
         try:
-            self.slack_error_mentions = ast.literal_eval(raw_mentions)
+            self.slack_error_mentions = ast.literal_eval(raw_mentions_on_err)
         except Exception as e:
             logger.error(f"Skipping @mentions for errors posted to Slack."
                          f" Unable to configure SLACK_USER_ID_MENTIONS_ON_ERROR due to: {e}")
             self.slack_error_mentions = {}
-        if self.slack_channel_token:
-            self._notify = self._notify_via_channel_token
-        elif self.slack_webhook_url:
+        raw_mentions_on_success = config.get("Slack", "SLACK_USER_ID_MENTIONS_ON_SUCCESS", fallback="{}")
+        try:
+            self.slack_success_mentions = ast.literal_eval(raw_mentions_on_success)
+        except Exception as e:
+            logger.error(f"Skipping @mentions for successes posted to Slack."
+                         f" Unable to configure SLACK_USER_ID_MENTIONS_ON_SUCCESS due to: {e}")
+            self.slack_success_mentions = {}
+
+        if self.slack_webhook_url:
             self._notify = self._notify_via_webhook
+        elif self.slack_channel_token:
+            self._notify = self._notify_via_channel_token
         else:
             self._notify = self._notify_noop
 

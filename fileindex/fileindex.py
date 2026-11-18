@@ -11,6 +11,9 @@ from argparse import ArgumentParser
 from collections import namedtuple
 from configparser import ConfigParser
 from typing import Optional, Union
+from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from fileindex.database import Database, DBFile
 from fileindex.filemanager import FileManager
@@ -24,14 +27,13 @@ from requests import Session
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+tz_utc = ZoneInfo("UTC")
+process_utc_start = datetime.now(tz_utc)
+
 Config = namedtuple(
     "Config",
     [
-        # New: selects which app's Cypher/UBKG/field-naming FileIndexingUtils binds.
         "app",
-        # New: passed to FileIndexingUtils so it can read [Slack] from the same file
-        # everything else here already comes from - Slack settings now live entirely
-        # inside FileIndexingUtils, not in this Config.
         "config_file_path",
         "database",
         "log_id",
@@ -46,10 +48,6 @@ Config = namedtuple(
         "neo4j_uri",
         "neo4j_username",
         "neo4j_password",
-        # Changed: was slack_webhook_url (the one setting this file read directly).
-        # Slack is now a richer, multi-key subsystem owned entirely by
-        # FileIndexingUtils (see file_indexing_utils.py) - this file only needs to
-        # know whether notifications are on at all, to pass through at construction.
         "slack_notifications",
         "ingest_api_url",
         "ubkg_url",
@@ -66,15 +64,11 @@ UUIDFileInfo = namedtuple(
 
 def parse_config() -> Config:
     parser = ArgumentParser(description="Index file info to Elastic Search.")
+    # The SenNet-specific or HuBMAP-specific configuration for this fileindex Python process.
     parser.add_argument(
         "--config", default="config.ini", help="Path to the configuration file (ini format)"
     )
-    # New: the config filescan (Go) also reads. Currently holds only DATABASE_FILEPATH
-    # - the one setting both tools need and must agree on. filescan's DIRECTORIES and
-    # PRUNABLE_FILEPATHS keys are Go-only right now; fileindex.py doesn't read them,
-    # since it derives its own directory structure from the Globus endpoint paths in
-    # --config instead. DATABASE_FILEPATH must NOT also be set in --config's [Local]
-    # section - this file is now the single source for it.
+    # The configuration file read by both filescan (Go) and this Python file.
     parser.add_argument(
         "--shared-config",
         default="src/config.ini",
@@ -104,30 +98,24 @@ def parse_config() -> Config:
     if not os.path.isfile(args.shared_config):
         parser.error(f"Shared config file not found: {args.shared_config}")
 
-    # New: a second, separate ConfigParser for the file filescan also reads. Kept
-    # separate from `c` below rather than merged into one parser, so it's always
-    # visually obvious in this function which file a given setting comes from.
-    # filescan's config uses a plain section named "Default" (capital D only) - this
-    # is NOT Python's special-cased [DEFAULT] section (that's spelled in full caps,
-    # and only matters for the `c` parser below, for the unrelated APP key); it's just
-    # an ordinary section here, matched by exact, case-sensitive name.
+    # Separate ConfigParser for each of the configuration files.
+    # N.B. The section named "Default" (capital D only) in the shared configuration
+    #      used by Go is NOT Python's special-cased [DEFAULT] section spelled in full caps.
+    #      Treated as an ordinary section Python, matched by exact, case-sensitive name.
     shared_c = ConfigParser()
     shared_c.read(args.shared_config)
 
     c = ConfigParser()
     c.read(args.config)
 
+    # Return a merged configuration from the shared files and arguments.
+    # N.B. The FileIndexingUtils class of file_indexing_utils.py loads further configuration from
+    #      the app-specific file, to be least disruptive to SenNet's use of this module.
     return Config(
-        # New: [DEFAULT] APP = hubmap|sennet, read from the same config.ini everything
-        # else here already comes from. Defaults to "hubmap" only to keep a config.ini
-        # that predates this key from breaking outright; every real config should set
-        # this explicitly rather than rely on the default.
-        app=c.get("DEFAULT", "APP", fallback="hubmap"),
         config_file_path=args.config,
-        # Changed: DATABASE_FILEPATH now comes from --shared-config, not --config.
-        # No fallback - there's no sane default database path, and a missing key here
-        # should fail loudly rather than silently fall back to a wrong/empty database.
+        force_update=args.force_update,
         database=shared_c.get("Default", "DATABASE_FILEPATH"),
+        app=c.get("DEFAULT", "APP", fallback="unconfigured"),
         log_id=c.get("Local", "LOG_ID", fallback="default"),
         log_level=c.get("Local", "LOG_LEVEL", fallback="info"),
         elastic_search_url=c.get("ElasticSearch", "ELASTIC_SEARCH_URL"),
@@ -140,28 +128,24 @@ def parse_config() -> Config:
         neo4j_uri=c.get("Neo4J", "NEO4J_URI"),
         neo4j_username=c.get("Neo4J", "NEO4J_USERNAME"),
         neo4j_password=c.get("Neo4J", "NEO4J_PASSWORD"),
-        # Unchanged: Slack is config-driven, not app-driven. This webhook mechanism
-        # already works for both projects with no modification, so it isn't touched
-        # by the app-switching work in this file.
-        # Changed: this file no longer reads SLACK_WEBHOOK_URL (or any other Slack
-        # key) directly - FileIndexingUtils reads all of [Slack] itself from the same
-        # --config file, via config_file_path above. Only whether notifications are
-        # enabled at all needs to come through to the constructor call below.
-        slack_notifications=c.get("Slack", "SLACK_NOTIFICATIONS", fallback="ENABLED"),
+        slack_notifications=c.get("Slack", "SLACK_NOTIFICATIONS", fallback=""),
         ingest_api_url=c.get("Service", "INGEST_API_URL"),
         ubkg_url=c.get("Service", "UBKG_URL"),
         uuid_api_url=c.get("Service", "UUID_API_URL"),
         dataset_uuids=dataset_uuids,
-        force_update=args.force_update,
     )
+config = parse_config()
 
+log_file = os.path.join(
+        "logs", f"es-file-index-{config.log_id}-{time.strftime('%Y-%m-%d-%H-%M-%S')}.log"
+    )
 
 def setup_logger(log_id: str, log_level: str) -> logging.Logger:
+    global log_file
+
     if not os.path.exists("logs"):
         os.makedirs("logs")
-    log_file = os.path.join(
-        "logs", f"es-file-index-{log_id}-{time.strftime('%Y-%m-%d-%H-%M-%S')}.log"
-    )
+
     logging.basicConfig(
         level=getattr(logging, log_level.upper()),
         format="%(asctime)s %(levelname)s %(message)s",
@@ -172,20 +156,15 @@ def setup_logger(log_id: str, log_level: str) -> logging.Logger:
 
 TIMEOUT = 30  # seconds
 
-# New: replaces the old blanket time.sleep(1) per dataset. Sits immediately before
-# the one call that actually needs spacing out (the UUID API fetch in
-# index_published_datasets) instead of throttling every dataset's SQLite/ES work
-# too. 0.05s is small enough that it's negligible at any real dataset count, but
-# still spaces out UUID API calls across a run.
+# A pause between Dataset's for calls which need to be spaced out, like
+# the UUID API fetch in index_published_datasets.
 UUID_API_PER_DATASET_PAUSE = 0.05
 
-
-config = parse_config()
 logger = setup_logger(config.log_id, config.log_level)
 terminate_event = threading.Event()
 
-# New: constructed once at startup from config.app. Everything app-specific below
-# reads from this object rather than branching on config.app itself.
+# An app-specific instance constructed using the app-specific configuration, to
+# minimize branching on config.app itself.
 try:
     file_indexing_utils = FileIndexingUtils(
         app=config.app,
@@ -205,10 +184,6 @@ try:
     file_manager = FileManager(
         ingest_api_url=config.ingest_api_url,
         ubkg_url=config.ubkg_url,
-        # New: FileManager's own UBKG call (_get_dataset_type_hierarchy, used for the
-        # dataset_type_hierarchy field) was hardcoded to application_context="sennet",
-        # separately from and missed by the fix to get_ubkg_organs() above. Now reads
-        # the same app-selected context file_indexing_utils already resolved.
         ubkg_application_context=file_indexing_utils.ubkg_application_context,
         token=config.globus_groups_token,
         session=session,
@@ -220,8 +195,6 @@ except Exception as e:
 
 
 def get_ubkg_organs() -> list[dict]:
-    # Changed: application_context was hardcoded to "sennet". Now reads from
-    # file_indexing_utils, which resolves to "hubmap" or "sennet" based on config.app.
     res = session.get(
         f"{config.ubkg_url}/organs?application_context={file_indexing_utils.ubkg_application_context}",
         timeout=TIMEOUT,
@@ -239,18 +212,24 @@ def get_files_from_uuid_api(dataset_uuid: str) -> list[dict]:
         headers={"Authorization": f"Bearer {config.globus_groups_token}"},
         timeout=TIMEOUT,
     )
-    if res.status_code != 200:
-        msg = f"Error fetching files: {res.status_code}"
-        raise Exception(msg)
-
-    return res.json()
+    if res.status_code >= 200 and res.status_code < 300:
+        return res.json()
+    elif res.status_code in [303]:
+        # When the response is stashed in an AWS S3 Bucket, follow the
+        # redirect to retrieve it.
+        s3_response = session.get(res.content.decode(), timeout=TIMEOUT)
+        if s3_response.status_code >= 200 and s3_response.status_code < 300:
+            return s3_response.json()
+        else:
+            err_msg =   f"Error fetching the large response content from AWS S3 at:" \
+                        f" {res.content.decode()}"
+    else:
+        err_msg = f"HTTP {res.status_code} error fetching files using:" \
+                  f" {config.uuid_api_url}/{dataset_uuid}/files"
+    raise Exception(err_msg)
 
 
 def get_dataset_globus_path(dataset: dict) -> str:
-    # Changed: type hint only, Record -> dict. dataset is now always a plain dict -
-    # either file_indexing_utils.parse_dataset_record()'s output (HuBMAP) or a
-    # dict(record) copy (SenNet) - never a raw neo4j.Record. Key-based access
-    # (dataset["x"]) behaves identically either way, so no behavior changes here.
     if dataset["contains_human_genetic_sequences"] is True:
         return os.path.join(
             config.globus_protected_endpoint_filepath, dataset["group_name"], dataset["uuid"]
@@ -265,14 +244,9 @@ def get_dataset_globus_path(dataset: dict) -> str:
 
 
 def get_docs_from_es_by_scroll(index: str, dataset_uuid: str, fields: list[str]) -> list[dict]:
-    # Renamed from get_docs_from_es, unchanged otherwise. Kept for comparison/
-    # reference - not called from either index_published_datasets or
-    # index_qa_datasets, which both call get_docs_from_es_stateless instead.
-    #
-    # Scroll opens a server-side context per call; doing that once per dataset
-    # against a small managed OpenSearch domain previously exhausted its
-    # scroll-context capacity and produced sustained HTTP 429s, silently skipping
-    # most of a run's reconciliation - see get_docs_from_es_stateless below.
+    # Stateful retrieval using the ElasticSearch Scroll API.
+    # Use get_docs_from_es_stateless() for an alternative which does not open a
+    # server-side context per call.
     scroll = "1m"  # save scroll context for 1 minute
     size = 10000
     docs = []
@@ -321,20 +295,12 @@ def get_docs_from_es_by_scroll(index: str, dataset_uuid: str, fields: list[str])
 
 
 def get_docs_from_es_stateless(index: str, dataset_uuid: str, fields: list[str]) -> list[dict]:
-    # New: replaces the Scroll-based reconciliation read above with stateless
-    # search_after pagination. search_after needs no server-side context at all -
-    # no context to exhaust, no inter-page sleep needed since there's no context to
-    # keep alive.
+    # Stateless retrieval using the ElasticSearch's search_after pagination to
+    # avoid server-side context resources and sleep() pacing.
     #
-    # Sorting by rel_path.keyword is a valid total order here because every query is
-    # filtered to a single dataset_uuid, making rel_path unique within the result
-    # set. Most datasets fit in one page, so the common case is a single request
-    # with no pagination round-trips at all.
-    #
-    # Also fixed along with the pagination change: the term query now targets
-    # dataset_uuid.keyword (the exact-match keyword sub-field) rather than bare
-    # dataset_uuid (the analyzed text field) - the correct target for an exact term
-    # match, confirmed present in this index's mapping.
+    # Count on the requirement that all files for a Dataset be under that directory for
+    # that Dataset, so rel_path.keyword is a valid sort for total ordering, and unique
+    # within the result set.
     size = 10000
     docs = []
     search_url = f"{config.elastic_search_url}/{index}/_search"
@@ -521,8 +487,7 @@ def index_published_datasets(
     num_errors = 0
     dataset_uuids = []
     with driver.session() as neo4j_session:
-        # Changed: the hardcoded SenNet Cypher string is now file_indexing_utils's
-        # app-selected published_query (HuBMAP or SenNet, chosen at startup).
+        # Use the app-specific query loaded from configuration at startup.
         datasets = neo4j_session.run(
             file_indexing_utils.published_query,
             dataset_uuids=config.dataset_uuids,
@@ -533,28 +498,13 @@ def index_published_datasets(
                 logger.info("Termination signal received, stopping indexing.")
                 return dataset_uuids, num_errors
 
-            # Changed: was an unconditional time.sleep(1) here, every dataset,
-            # regardless of whether this phase even calls an external API that needs
-            # throttling (it does, a few lines below - but a blanket sleep here
-            # throttles the SQLite/ES work above it too, work that isn't the actual
-            # target). At HuBMAP's original dataset count this alone cost ~5 hours of
-            # pure sleep per run. The targeted replacement sits immediately before
-            # the one call that actually needs spacing out - see UUID_API_PER_DATASET_PAUSE
-            # below.
-
-            # New: record this dataset's uuid unconditionally, before attempting to
-            # parse it below. A dataset that fails to parse still exists in Neo4j - it
-            # isn't gone, just unparsable this run. Appending the uuid here protects it
-            # from main()'s end-of-run stale-dataset cleanup, which deletes ES
-            # documents for any dataset_uuid NOT in this list. Appending only after a
-            # successful parse would make a parse failure look identical to a deleted
-            # dataset, and incorrectly delete that dataset's real ES documents.
+            # Record this Dataset's UUID before attempting to parse, so a parse failure
+            # does not look like a deleted dataset during end-of-run stale-dataset cleanup.
             dataset_uuids.append(raw_record["uuid"])
 
-            # New: converts the raw Neo4j record into a plain dict, parsing
-            # metadata_str/files_str for HuBMAP (see file_indexing_utils.py). Returns
-            # None if parsing failed - skip just this one dataset, already counted
-            # above so its existing ES documents aren't touched by the stale cleanup.
+            # Converts the raw Neo4j record into a plain dict, accounting for app-specific
+            # formats (e.g. JSON for SenNet, Python strings for HuBMAP.)
+            # Logs Datasets which do not parse.
             dataset = file_indexing_utils.parse_dataset_record(raw_record)
             if dataset is None:
                 num_errors += 1
@@ -590,10 +540,7 @@ def index_published_datasets(
                 continue
 
             try:
-                # New: the targeted replacement for the old blanket sleep(1) - a
-                # small pause right before the one call that needs it, timed with
-                # threshold=0.0 so its total cost across a run is visible in the
-                # log even though each individual pause is tiny.
+                # sleep() as needed to pace UUID API usage, logging the timing.
                 with TimedStep(logger, f"UUID API pause for dataset {dataset['uuid']}", threshold=0.0):
                     time.sleep(UUID_API_PER_DATASET_PAUSE)
 
@@ -751,10 +698,8 @@ def index_published_datasets(
                             "size": uuid_file["size"],
                             "last_modified_at": local_file.last_modified_at,
                         }
-                        # Changed: "dataset_sennet_id"/"sources" were hardcoded here.
-                        # build_identity_fields() returns the right field names and
-                        # values for whichever app is active (dataset_hubmap_id/donors,
-                        # or dataset_sennet_id/sources).
+                        # Update the ElasticSearch Document for the Dataset with
+                        # the app-specific fields.
                         doc.update(file_indexing_utils.build_identity_fields(dataset))
                         if additional_info is not None:
                             doc.update(additional_info)
@@ -785,7 +730,7 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
     num_errors = 0
     dataset_uuids = []
     with driver.session() as neo4j_session:
-        # Changed: see index_published_datasets above - same substitution, QA query.
+        # Use the app-specific query loaded from configuration at startup.
         datasets = neo4j_session.run(
             file_indexing_utils.qa_query,
             dataset_uuids=config.dataset_uuids,
@@ -796,14 +741,13 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
                 logger.info("Termination signal received, stopping indexing.")
                 return dataset_uuids, num_errors
 
-            # Changed: removed the old blanket time.sleep(1) entirely, with no
-            # replacement - this phase never calls the UUID API (that only happens
-            # in index_published_datasets), so there's nothing here that needs
-            # pacing against an external service.
-
-            # New: see index_published_datasets above for why this is unconditional.
+            # Record this Dataset's UUID before attempting to parse, so a parse failure
+            # does not look like a deleted dataset during end-of-run stale-dataset cleanup.
             dataset_uuids.append(raw_record["uuid"])
 
+            # Converts the raw Neo4j record into a plain dict, accounting for app-specific
+            # formats (e.g. JSON for SenNet, Python strings for HuBMAP.)
+            # Logs Datasets which do not parse.
             dataset = file_indexing_utils.parse_dataset_record(raw_record)
             if dataset is None:
                 num_errors += 1
@@ -934,7 +878,8 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
                         "size": local_file.size,
                         "last_modified_at": local_file.last_modified_at,
                     }
-                    # Changed: see index_published_datasets above - same substitution.
+                    # Update the ElasticSearch Document for the Dataset with
+                    # the app-specific fields.
                     doc.update(file_indexing_utils.build_identity_fields(dataset))
                     if additional_info is not None:
                         doc.update(additional_info)
@@ -956,11 +901,76 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
 
     return dataset_uuids, num_errors
 
+def post_launch_to_slack():
+    if config.app == 'hubmap':
+        msg = f":file_folder: {file_indexing_utils.get_slack_host_context()} :file_folder: file-management-service :diamonds: {Path(__file__).name} :file_folder:\n" \
+              f"{file_indexing_utils.slack_neutral_info_emoji} Launched to maintain Elasticsearch indices" \
+              f" `{config.elastic_search_public_index}` and `{config.elastic_search_private_index}`\n" \
+              f" Process logging to {log_file}\n" \
+              f":file_folder:"
+        try:
+            file_indexing_utils.postToSlackChannel(channel=file_indexing_utils.slack_notification_channel
+                                                   , msg=msg)
+        except Exception as e:
+            logger.exception('Unable to post Slack start notification.')
+
+def post_conclusion_to_slack(num_errors: int):
+    process_utc_finish = datetime.now(tz_utc)
+    if num_errors > 0:
+        try:
+            if config.app == 'sennet':
+                file_indexing_utils.postToSlackChannel(
+                    channel=file_indexing_utils.slack_notification_channel,
+                    msg=(
+                        f"{num_errors} errors occurred during {config.log_id} Elastic Search "
+                        "file indexing."
+                    ),
+                    mentions_dict=file_indexing_utils.slack_error_mentions,
+                )
+            elif config.app == 'hubmap':
+                bad_news = f":file_folder: {file_indexing_utils.get_slack_host_context()} :file_folder: file-management-service :diamonds: {Path(__file__).name} :file_folder:\n" \
+                           f"{file_indexing_utils.slack_bad_news_emoji} The process started at {process_utc_start.strftime('%Y-%m-%d %H:%M:%S %Z')}" \
+                           f" exited after {int((datetime.now(tz_utc) - process_utc_start).total_seconds())} seconds." \
+                           f" {num_errors} errors occurred during {config.log_id} ElasticSearch file indexing.\n" \
+                           f" Process logged to {log_file}\n" \
+                           f"{':black_square_button::skull_and_crossbones: ' * 5}\n" \
+                           f":file_folder:"
+                try:
+                    file_indexing_utils.postToSlackChannel(channel=file_indexing_utils.slack_notification_channel
+                                                           , msg=bad_news)
+                except Exception as e:
+                    logger.exception('Unable to post Slack start notification.')
+            else:
+                logger.error(f"Unrecognized value for config.app={config.app}")
+        except Exception as e:
+            logger.error(f"Error posting to Slack: {e}")
+    else:
+        if config.app == 'sennet':
+            pass
+        elif config.app == 'hubmap':
+            good_news = f":file_folder: {file_indexing_utils.get_slack_host_context()} :file_folder: file-management-service :diamonds: {Path(__file__).name} :file_folder:\n" \
+                        f"{file_indexing_utils.slack_good_news_emoji} The process started at {process_utc_start.strftime('%Y-%m-%d %H:%M:%S %Z')}" \
+                        f" finished at {process_utc_finish.strftime('%Y-%m-%d %H:%M:%S %Z')} after" \
+                        f" {int((process_utc_finish - process_utc_start).total_seconds() // 60)} minutes.\n" \
+                        f" `{config.elastic_search_public_index}` and `{config.elastic_search_private_index}`\n" \
+                        f" Process logged to {log_file}\n" \
+                        f"{':light_blue_heart: ' * 5}\n" \
+                        f":file_folder:"
+
+            try:
+                file_indexing_utils.postToSlackChannel(channel=file_indexing_utils.slack_notification_channel
+                                                       , msg=good_news
+                                                       , mentions_dict=file_indexing_utils.slack_success_mentions)
+            except Exception as e:
+                logger.exception('Unable to post Slack success notification.')
+
+        else:
+            logger.error(f"Unrecognized value for config.app={config.app}")
 
 def main():
+    post_launch_to_slack()
     try:
-        # Changed: "organ_uberon" was hardcoded. Now reads file_indexing_utils's
-        # app-selected key ("rui_code" for HuBMAP, "organ_uberon" for SenNet).
+        # Retrieve using the app-specific key
         ubkg_organs = {o[file_indexing_utils.ubkg_organ_key]: o for o in get_ubkg_organs()}
     except Exception as e:
         logger.error(f"Error fetching UBKG organs: {e}")
@@ -1025,24 +1035,8 @@ def main():
     if terminate_event.is_set():
         return
 
-    # Changed: was a bare webhook POST directly in this function. Now routed through
-    # FileIndexingUtils, which picks whichever Slack style (bot-token channel or
-    # webhook) is configured, applies @mentions, and is a safe no-op if neither style
-    # is configured or notifications are disabled - so this call never needs its own
-    # "is Slack set up" check the way the old bare POST did.
-    if num_errors > 0:
-        try:
-            file_indexing_utils.postToSlackChannel(
-                channel=file_indexing_utils.slack_notification_channel,
-                msg=(
-                    f"{num_errors} errors occurred during {config.log_id} Elastic Search "
-                    "file indexing."
-                ),
-                mentions_dict=file_indexing_utils.slack_error_mentions,
-            )
-        except Exception as e:
-            logger.error(f"Error posting to Slack: {e}")
-
+    logger.info(f"Posting Slack message based upon {config.log_id} {config.app} ending with {num_errors} errors.")
+    post_conclusion_to_slack(num_errors)
 
 if __name__ == "__main__":
     try:

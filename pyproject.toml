@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "sennet-chat"
+name = "file-management-service-fileindex"
 version = "0.1.0"
-description = "SenNet Chat CLI"
+description = "X-Atlas Consortia Dataset file indexing"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["neo4j>=5.28.6,<6.0", "PyYAML>=6.0.3,<7.0.0", "requests>=2.34.2,<2.35.0"]

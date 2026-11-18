@@ -37,27 +37,29 @@ class Database:
         self.close()
 
     def query_files(self, path_prefix: str) -> list[DBFile]:
-        # Changed: WHERE path LIKE ? forced a full scan of the path index on every
-        # call - confirmed via EXPLAIN QUERY PLAN against the original HuBMAP
-        # database, and the single largest cost in the whole nightly pipeline there
-        # (~29,000s total across ~11k datasets, a ~1.4s floor per call regardless of
-        # dataset size). path >= ? AND path < ? (a half-open range) selects exactly
-        # the same rows but lets SQLite seek directly to this dataset's slice of the
-        # index instead of scanning every row.
+        # Avoid a "WHERE path LIKE ?" clauses which forces a full scan of the
+        # path index on each call.
+        # "WHERE path >= ? AND path < ?" selects the same rows directly seeking
+        # the dataset's slice of the index instead of scanning every row.
         #
-        # ROW_NUMBER() replaces the (path, last_modified_at) IN (SELECT path,
-        # MAX(last_modified_at) ... GROUP BY path) form, which returned BOTH rows for
-        # a path on a last_modified_at tie and let a downstream dict key collision
-        # pick between them nondeterministically. Ties here are broken by version -
-        # PRIMARY KEY (path, version) is monotonic, so the higher version is always
-        # the genuinely newer row.
+        # ROW_NUMBER() indicates file revisions, with 1 indicating the "latest" file,
+        # filtered by the outer SELECT.
+        #
+        # "Latest" file identify by version ordering alone. version is assigned by
+        # insert_files() as MAX(version) + 1 on every insert, so it strictly reflects
+        # insert order regardless of what a file's mtime claims.
+        # last_modified_at is the file's mtime, which is outside our control. A file
+        # whose mtime moves backward (e.g. restored from an earlier backup) would make
+        # last_modified_at DESC pick a stale row as "latest."
+        # version does not have the vulnerability, and ties in row selection are not
+        # possible because (path, version) is the table's primary key.
         upper_bound = _prefix_upper_bound(path_prefix)
         query = """
             SELECT path, size, last_modified_at FROM (
                 SELECT path, size, last_modified_at,
                        ROW_NUMBER() OVER (
                            PARTITION BY path
-                           ORDER BY last_modified_at DESC, version DESC
+                           ORDER BY version DESC
                        ) AS rn
                 FROM files
                 WHERE path >= ? AND path < ? AND deleted_at IS NULL

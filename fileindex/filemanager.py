@@ -27,24 +27,15 @@ class FileManager:
         self._logger = logger
         self._ivt_directory_schemas = None
         self._primary_schemas = dict()
-        # Cache assaytype API responses keyed by dataset UUID, to avoid repeated HTTP
-        # calls to /assaytype/{dataset_uuid} for every file in the same dataset - this
-        # call only depends on dataset_uuid, so its result is identical for every file
-        # within one dataset. Only successful responses are cached; a failed fetch
-        # still raises and is retried on the next file, same as before this cache
-        # existed.
+        # Cache assaytype API responses keyed by Dataset UUID, to avoid repeated HTTP
+        # calls to /assaytype/{dataset_uuid} for every file in the same dataset.
         self._assay_type_cache = dict()
         self._processed_files = (
             "",  # current dataset UUID
             dict(),  # mapping of file paths to descriptions
         )
-        # Dataset type hierarchy is a SenNet-only concept (see
-        # _get_dataset_type_hierarchy's docstring) - skip the call entirely for any
-        # other app, rather than calling it and relying on it to raise. The method's
-        # own guard stays in place as a defense against future misuse, but normal
-        # operation for a non-SenNet app should never reach it. get_additional_info()
-        # already handles an empty map gracefully via .get(...), so no change needed
-        # there - a HuBMAP dataset simply never gets a dataset_type_hierarchy field.
+        # Dataset type hierarchy is a SenNet-only concept. Skip the call entirely for any
+        # other app rather than elying on it to raise an exception.
         if ubkg_application_context == "sennet":
             self._dataset_type_hierarchy_map = self._get_dataset_type_hierarchy(
                 ubkg_url, ubkg_application_context, session
@@ -68,6 +59,7 @@ class FileManager:
                         break
             except Exception as e:
                 self._logger.error(f"Error fetching description for dataset {dataset['uuid']}: {e}")
+                raise e
 
             # get the analyte class and assay_input_entity from the dataset type
             try:
@@ -80,23 +72,29 @@ class FileManager:
                 if assay_input_entity:
                     info["assay_input_entity"] = assay_input_entity
             except Exception as e:
-                self._logger.error(
-                    f"Error fetching analyte_class for dataset {dataset['uuid']}: {e}"
-                )
+                self._logger.error(f"Error fetching analyte_class for dataset {dataset['uuid']}: {e}")
+                raise e
 
             # get the dataset type hierarchy
             try:
                 if hierarchy := self._dataset_type_hierarchy_map.get(dataset["dataset_type"]):
                     info["dataset_type_hierarchy"] = hierarchy
             except Exception as e:
-                self._logger.error(
-                    f"Error fetching dataset_type_hierarchy for dataset {dataset['uuid']}: {e}"
-                )
+                self._logger.error(f"Error fetching dataset_type_hierarchy for dataset {dataset['uuid']}: {e}")
+                # KBKBKB @TODO coordinate this with SN
+                # raise e
 
             return info
 
-        elif dataset["creation_action"] == "Central Process":
+        elif dataset["creation_action"] == "Lab Process":
+            # Lab Process datasets are empty shells in Neo4j with no schema, no files,
+            # and no metadata. No further Lab Process datasets are expected.
+            self._logger.warning(f"Ignoring Lab Process dataset {dataset['uuid']} - no indexable content.")
+            return {}
+
+        elif dataset["creation_action"] in ["Central Process", "External Process"]:
             # processed dataset
+            # External Process confirmed equivalent to Central Process (2026-06-17 ADVISE analysis)
             if self._processed_files[0] != dataset["uuid"]:
                 # cache the processed files for this dataset
                 # in the format {rel_path: dict(description, is_data_product, is_qa_qc, data_class)}
@@ -122,6 +120,7 @@ class FileManager:
             raise Exception(f"Unknown creation_action: {dataset['creation_action']}")
 
     def _get_latest_file_schema(self, dataset_uuid: str) -> list[dict]:
+        # Do not call Ingest API to retrieve assay types already cached.
         if dataset_uuid not in self._assay_type_cache:
             res = self._session.get(
                 f"{self._ingest_api_url}/assaytype/{dataset_uuid}",
