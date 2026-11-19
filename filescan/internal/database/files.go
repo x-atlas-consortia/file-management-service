@@ -126,7 +126,7 @@ func (d *Database) MarkFilesDeleted(ctx context.Context, paths []string, deleted
 	return nil
 }
 
-// InsertWalkedPaths records paths seen during the current backup walk in the walked_paths temp table
+// InsertWalkedPaths records paths seen during the current scan walk in the walked_paths temp table
 func (d *Database) InsertWalkedPaths(ctx context.Context, paths []string) error {
 	if len(paths) == 0 {
 		return nil

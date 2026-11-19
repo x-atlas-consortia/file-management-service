@@ -136,7 +136,7 @@ func New(ctx context.Context, dsn string, readonly bool) (*Database, error) {
 			return nil, fmt.Errorf("error applying migrations: %w", err)
 		}
 
-		// walked_paths tracks which known files were seen during the current backup walk
+		// walked_paths tracks which known files were seen during the current scan walk
 		if _, err := db.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS walked_paths (path TEXT PRIMARY KEY) WITHOUT ROWID`); err != nil {
 			db.Close()
 			if lockFile != nil {

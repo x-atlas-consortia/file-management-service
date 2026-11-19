@@ -29,7 +29,7 @@ func Start(ctx context.Context, logLevel slog.Leveler, cfg *core.Config) error {
 
 	dbPath := cfg.DatabaseFilepath
 
-	logger.Info("Starting file backup process",
+	logger.Info("Starting file scan process",
 		slog.Int("directories", len(directories)),
 		slog.Int("walkers", walkers),
 		slog.Int("processors", processors),
